@@ -57,15 +57,42 @@ def load_test_data() -> pd.DataFrame:
     return test_df
 
 
+def prepare_clean_text_columns(test_df: pd.DataFrame) -> pd.DataFrame:
+    """Create cleaned text columns once to avoid repeated `cleaner`呼び出し."""
+
+    columns = [
+        "body",
+        "positive_example_1",
+        "positive_example_2",
+        "negative_example_1",
+        "negative_example_2",
+        "rule",
+    ]
+
+    for col in columns:
+        clean_col = f"{col}_clean"
+
+        # 変更理由: 大規模データで毎回 cleaner を呼ぶとボトルネックになるため、
+        #          事前に正規化済みテキスト列を持たせて後段処理を高速化する。
+        test_df.loc[:, clean_col] = test_df[col].map(
+            lambda val: cleaner(str(val)) if pd.notna(val) else None
+        )
+
+    return test_df
+
+
 def collect_all_texts(test_df: pd.DataFrame) -> List[str]:
     """Collect all unique texts from test set."""
     print("\nCollecting all texts for embedding...")
 
     all_texts = set()
 
-    for body in test_df["body"]:
+    body_col = "body_clean" if "body_clean" in test_df.columns else "body"
+
+    for body in test_df[body_col]:
         if pd.notna(body):
-            all_texts.add(cleaner(str(body)))
+            text = str(body) if body_col.endswith("_clean") else cleaner(str(body))
+            all_texts.add(text)
 
     example_cols = [
         "positive_example_1",
@@ -75,9 +102,15 @@ def collect_all_texts(test_df: pd.DataFrame) -> List[str]:
     ]
 
     for col in example_cols:
-        for example in test_df[col]:
+        clean_col = f"{col}_clean" if f"{col}_clean" in test_df.columns else col
+        for example in test_df[clean_col]:
             if pd.notna(example):
-                all_texts.add(cleaner(str(example)))
+                text = (
+                    str(example)
+                    if clean_col.endswith("_clean")
+                    else cleaner(str(example))
+                )
+                all_texts.add(text)
 
     all_texts = list(all_texts)
     print(f"Collected {len(all_texts)} unique texts")
@@ -323,14 +356,14 @@ def load_or_create_finetuned_model(test_df: pd.DataFrame) -> SentenceTransformer
 
 
 class RuleCentroidSummary(TypedDict):
-    compliant_centroids: List[np.ndarray]
-    violating_centroids: List[np.ndarray]
-    compliant_counts: List[int]
-    violating_counts: List[int]
-    compliant_radii: List[float]
-    violating_radii: List[float]
-    compliant_weights: List[float]
-    violating_weights: List[float]
+    compliant_centroids: np.ndarray
+    violating_centroids: np.ndarray
+    compliant_counts: np.ndarray
+    violating_counts: np.ndarray
+    compliant_radii: np.ndarray
+    violating_radii: np.ndarray
+    compliant_weight_inv: np.ndarray
+    violating_weight_inv: np.ndarray
 
 
 def softmin(dist_mat: np.ndarray, tau: float = 0.08) -> np.ndarray:
@@ -362,29 +395,37 @@ def _cluster_embeddings(
     embeddings: List[np.ndarray],
     max_clusters: int = 3,
     eps: float = 1e-6,
-) -> Tuple[List[np.ndarray], List[int], List[float], List[float]]:
-    """Cluster embeddings and return centroid statistics.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Cluster embeddings and return centroid statistics as numpy arrays."""
 
-    AgglomerativeClustering (Ward linkage / Euclidean) を使い、
-    サンプル数に応じて最大 ``max_clusters`` 個までボトムアップにクラスタを生成し、
-    各クラスタの平均ベクトルを正規化して代表点とします。
-    """
     if not embeddings:
-        return [], [], [], []
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
 
-    matrix = np.vstack(embeddings)
+    matrix = np.vstack(embeddings).astype(np.float32)
+
     if matrix.shape[0] == 1:
         centroid = _normalize(matrix[0])
-        return [centroid], [1], [0.0], [1.0 / eps]
+        radii = np.array([0.0], dtype=np.float32)
+        counts = np.array([1], dtype=np.int32)
+        weight_inv = (radii + eps) / counts.astype(np.float32)
+        return centroid[None, :], counts, radii, weight_inv
 
     n_clusters = min(max_clusters, matrix.shape[0])
 
     if n_clusters <= 1:
         centroid = _normalize(matrix.mean(axis=0))
-        distances = np.linalg.norm(matrix - centroid, axis=1)
+        diff = matrix - centroid
+        distances = np.sqrt(np.sum(diff * diff, axis=1, dtype=np.float32))
         radius = float(distances.mean())
-        weight = float(matrix.shape[0] / (radius + eps))
-        return [centroid], [matrix.shape[0]], [radius], [weight]
+        radii = np.array([radius], dtype=np.float32)
+        counts = np.array([matrix.shape[0]], dtype=np.int32)
+        weight_inv = (radii + eps) / counts.astype(np.float32)
+        return centroid[None, :], counts, radii, weight_inv
 
     # 変更理由: 正例・負例それぞれで複数クラスタを持たせ、
     #          後段の1-NN距離比較に使うためAgglomerativeClusteringで代表点を抽出。
@@ -392,21 +433,24 @@ def _cluster_embeddings(
     clusterer = AgglomerativeClustering(n_clusters=n_clusters)
     labels = clusterer.fit_predict(matrix)
 
-    centroids: List[np.ndarray] = []
-    counts: List[int] = []
-    radii: List[float] = []
-    weights: List[float] = []
+    centroid_list: List[np.ndarray] = []
+    count_list: List[int] = []
+    radius_list: List[float] = []
     for cluster_id in np.unique(labels):
         cluster_embeddings = matrix[labels == cluster_id]
         centroid = _normalize(cluster_embeddings.mean(axis=0))
-        centroids.append(centroid)
-        counts.append(int(cluster_embeddings.shape[0]))
-        distances = np.linalg.norm(cluster_embeddings - centroid, axis=1)
-        radius = float(distances.mean())
-        radii.append(radius)
-        weights.append(float(counts[-1] / (radius + eps)))
+        centroid_list.append(centroid)
+        count_list.append(int(cluster_embeddings.shape[0]))
+        diff = cluster_embeddings - centroid
+        distances = np.sqrt(np.sum(diff * diff, axis=1, dtype=np.float32))
+        radius_list.append(float(distances.mean()))
 
-    return centroids, counts, radii, weights
+    centroids = np.vstack(centroid_list).astype(np.float32)
+    counts = np.asarray(count_list, dtype=np.int32)
+    radii = np.asarray(radius_list, dtype=np.float32)
+    weight_inv = (radii + eps) / np.maximum(counts.astype(np.float32), 1.0)
+
+    return centroids, counts, radii, weight_inv
 
 
 def create_rule_centroids(
@@ -423,23 +467,34 @@ def create_rule_centroids(
 
     rule_centroids: Dict[str, RuleCentroidSummary] = {}
 
-    for rule in test_df["rule"].unique():
-        rule_data = test_df[test_df["rule"] == rule]
+    compliant_cols = [
+        f"{col}_clean" if f"{col}_clean" in test_df.columns else col
+        for col in ["negative_example_1", "negative_example_2"]
+    ]
+    violating_cols = [
+        f"{col}_clean" if f"{col}_clean" in test_df.columns else col
+        for col in ["positive_example_1", "positive_example_2"]
+    ]
 
+    for rule, rule_data in test_df.groupby("rule", sort=False):
         compliant_embeddings: List[np.ndarray] = []
         violating_embeddings: List[np.ndarray] = []
 
-        for _, row in rule_data.iterrows():
-            for col in ["negative_example_1", "negative_example_2"]:
-                if pd.notna(row[col]):
-                    clean_text = cleaner(str(row[col]))
-                    if clean_text in text_to_embedding:
-                        compliant_embeddings.append(text_to_embedding[clean_text])
-            for col in ["positive_example_1", "positive_example_2"]:
-                if pd.notna(row[col]):
-                    clean_text = cleaner(str(row[col]))
-                    if clean_text in text_to_embedding:
-                        violating_embeddings.append(text_to_embedding[clean_text])
+        for row in rule_data.itertuples(index=False):
+            for col in compliant_cols:
+                value = getattr(row, col)
+                if not value:
+                    continue
+                key = value if col.endswith("_clean") else cleaner(str(value))
+                if key in text_to_embedding:
+                    compliant_embeddings.append(text_to_embedding[key])
+            for col in violating_cols:
+                value = getattr(row, col)
+                if not value:
+                    continue
+                key = value if col.endswith("_clean") else cleaner(str(value))
+                if key in text_to_embedding:
+                    violating_embeddings.append(text_to_embedding[key])
 
         if not compliant_embeddings or not violating_embeddings:
             continue
@@ -448,7 +503,7 @@ def create_rule_centroids(
             compliant_centroids,
             compliant_counts,
             compliant_radii,
-            compliant_weights,
+            compliant_weight_inv,
         ) = _cluster_embeddings(
             compliant_embeddings, max_clusters=max_clusters
         )
@@ -456,7 +511,7 @@ def create_rule_centroids(
             violating_centroids,
             violating_counts,
             violating_radii,
-            violating_weights,
+            violating_weight_inv,
         ) = _cluster_embeddings(
             violating_embeddings, max_clusters=max_clusters
         )
@@ -468,8 +523,8 @@ def create_rule_centroids(
             "violating_counts": violating_counts,
             "compliant_radii": compliant_radii,
             "violating_radii": violating_radii,
-            "compliant_weights": compliant_weights,
-            "violating_weights": violating_weights,
+            "compliant_weight_inv": compliant_weight_inv,
+            "violating_weight_inv": violating_weight_inv,
         }
 
         print(
@@ -482,26 +537,6 @@ def create_rule_centroids(
 
     print(f"Created centroids for {len(rule_centroids)} rules")
     return rule_centroids
-
-
-def _weighted_distances(
-    embedding: np.ndarray,
-    centroids: List[np.ndarray],
-    weights: List[float],
-    eps: float = 1e-6,
-) -> np.ndarray:
-    """Compute distance to each centroid with cluster-based reweighting."""
-
-    if not centroids:
-        return np.asarray([])
-
-    distances = np.array(
-        [np.linalg.norm(embedding - centroid) for centroid in centroids],
-        dtype=np.float64,
-    )
-    weight_arr = np.asarray(weights, dtype=np.float64)
-    adjusted = distances / np.maximum(weight_arr, eps)
-    return adjusted
 
 
 def predict_test_set_with_centroids(
@@ -517,48 +552,64 @@ def predict_test_set_with_centroids(
     row_ids: List[int] = []
     predictions: List[float] = []
 
-    for rule in test_df["rule"].unique():
-        rule_data = test_df[test_df["rule"] == rule]
+    body_col = "body_clean" if "body_clean" in test_df.columns else "body"
 
+    for rule, rule_data in test_df.groupby("rule", sort=False):
         if rule not in rule_centroids:
             continue
 
-        compliant_centroids = rule_centroids[rule]["compliant_centroids"]
-        violating_centroids = rule_centroids[rule]["violating_centroids"]
-        compliant_weights = rule_centroids[rule]["compliant_weights"]
-        violating_weights = rule_centroids[rule]["violating_weights"]
+        summary = rule_centroids[rule]
+        compliant_centroids = summary["compliant_centroids"]
+        violating_centroids = summary["violating_centroids"]
 
-        per_rule_results: List[Tuple[int, float]] = []
-
-        for _, row in rule_data.iterrows():
-            body = cleaner(str(row["body"]))
-            row_id = row["row_id"]
-
-            if body not in text_to_embedding:
-                continue
-
-            body_embedding = text_to_embedding[body]
-
-            compliant_adjusted = _weighted_distances(
-                body_embedding, compliant_centroids, compliant_weights
-            )
-            violating_adjusted = _weighted_distances(
-                body_embedding, violating_centroids, violating_weights
-            )
-
-            if compliant_adjusted.size == 0 or violating_adjusted.size == 0:
-                continue
-
-            compliant_score = float(softmin(compliant_adjusted, tau=tau))
-            violating_score = float(softmin(violating_adjusted, tau=tau))
-            rule_prediction = violating_score - compliant_score
-
-            per_rule_results.append((row_id, rule_prediction))
-
-        if not per_rule_results:
+        if compliant_centroids.size == 0 or violating_centroids.size == 0:
             continue
 
-        rule_scores = np.array([score for _, score in per_rule_results], dtype=np.float64)
+        compliant_weight_inv = summary["compliant_weight_inv"]
+        violating_weight_inv = summary["violating_weight_inv"]
+
+        body_embeddings: List[np.ndarray] = []
+        body_row_ids: List[int] = []
+
+        for row in rule_data.itertuples(index=False):
+            body_value = getattr(row, body_col)
+            if not body_value:
+                continue
+
+            body_key = (
+                body_value if body_col.endswith("_clean") else cleaner(str(body_value))
+            )
+
+            embedding = text_to_embedding.get(body_key)
+            if embedding is None:
+                continue
+
+            body_embeddings.append(embedding)
+            body_row_ids.append(getattr(row, "row_id"))
+
+        if not body_embeddings:
+            continue
+
+        body_matrix = np.vstack(body_embeddings).astype(np.float32)
+
+        # 変更理由: ループを排して (M, C, D) のテンソル計算に置き換えることで、
+        #          数万件規模の推論でも NumPy のベクトル化によりスループットを向上させる。
+        compliant_diff = body_matrix[:, None, :] - compliant_centroids[None, :, :]
+        compliant_dist = np.sqrt(
+            np.sum(compliant_diff * compliant_diff, axis=2, dtype=np.float32)
+        )
+        compliant_adjusted = compliant_dist * compliant_weight_inv[None, :]
+
+        violating_diff = body_matrix[:, None, :] - violating_centroids[None, :, :]
+        violating_dist = np.sqrt(
+            np.sum(violating_diff * violating_diff, axis=2, dtype=np.float32)
+        )
+        violating_adjusted = violating_dist * violating_weight_inv[None, :]
+
+        compliant_scores = np.asarray(softmin(compliant_adjusted, tau=tau), dtype=np.float64)
+        violating_scores = np.asarray(softmin(violating_adjusted, tau=tau), dtype=np.float64)
+        rule_scores = violating_scores - compliant_scores
+
         rule_mean = float(rule_scores.mean())
         rule_std = float(rule_scores.std())
 
@@ -567,9 +618,8 @@ def predict_test_set_with_centroids(
         else:
             normalized_scores = rule_scores - rule_mean
 
-        for (row_id, _), normalized_score in zip(per_rule_results, normalized_scores):
-            row_ids.append(row_id)
-            predictions.append(float(normalized_score))
+        row_ids.extend(body_row_ids)
+        predictions.extend(normalized_scores.astype(float))
 
     print(f"Made predictions for {len(predictions)} test examples")
     return row_ids, np.array(predictions)
@@ -582,6 +632,7 @@ def main():
     print("=" * 70)
 
     test_df = load_test_data()
+    test_df = prepare_clean_text_columns(test_df)
 
     print("\n" + "=" * 50)
     print("MODEL PREPARATION PHASE")
@@ -595,7 +646,9 @@ def main():
     print("=" * 50)
     all_embeddings = generate_embeddings(all_texts, model)
 
-    text_to_embedding = {text: emb for text, emb in zip(all_texts, all_embeddings)}
+    text_to_embedding = {
+        text: np.asarray(emb, dtype=np.float32) for text, emb in zip(all_texts, all_embeddings)
+    }
 
     rule_centroids = create_rule_centroids(
         test_df,
