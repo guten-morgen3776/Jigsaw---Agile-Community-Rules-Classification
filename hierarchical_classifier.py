@@ -380,7 +380,11 @@ def softmin(dist_mat: np.ndarray, tau: float = 0.08) -> np.ndarray:
     m = x.max(axis=1, keepdims=True)
     sm = np.exp(x - m).sum(axis=1, keepdims=True)
     result = (-tau) * (np.log(sm) + m)
-    return result.squeeze()
+
+    # 変更理由: squeeze() だとサンプル数が1件のときに0次元スカラーへ潰れてしまい、
+    #          後段処理でイテラブルとして扱えずエラーになるため、axis=1を固定で
+    #          取り出して (M,) 形状を維持する。
+    return result[:, 0]
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
