@@ -327,6 +327,27 @@ class RuleCentroidSummary(TypedDict):
     violating_centroids: List[np.ndarray]
     compliant_counts: List[int]
     violating_counts: List[int]
+    compliant_radii: List[float]
+    violating_radii: List[float]
+    compliant_weights: List[float]
+    violating_weights: List[float]
+
+
+def softmin(dist_mat: np.ndarray, tau: float = 0.08) -> np.ndarray:
+    """Temperature-controlled smooth minimum for distance aggregation."""
+
+    if tau <= 0:
+        raise ValueError("tau must be positive for softmin")
+
+    distances = np.asarray(dist_mat, dtype=np.float64)
+    if distances.ndim == 1:
+        distances = distances[None, :]
+
+    x = -distances / max(1e-12, tau)
+    m = x.max(axis=1, keepdims=True)
+    sm = np.exp(x - m).sum(axis=1, keepdims=True)
+    result = (-tau) * (np.log(sm) + m)
+    return result.squeeze()
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -340,25 +361,30 @@ def _normalize(vec: np.ndarray) -> np.ndarray:
 def _cluster_embeddings(
     embeddings: List[np.ndarray],
     max_clusters: int = 3,
-) -> Tuple[List[np.ndarray], List[int]]:
-    """Cluster embeddings and return (centroid, cluster_size) tuples.
+    eps: float = 1e-6,
+) -> Tuple[List[np.ndarray], List[int], List[float], List[float]]:
+    """Cluster embeddings and return centroid statistics.
 
     AgglomerativeClustering (Ward linkage / Euclidean) を使い、
     サンプル数に応じて最大 ``max_clusters`` 個までボトムアップにクラスタを生成し、
     各クラスタの平均ベクトルを正規化して代表点とします。
     """
     if not embeddings:
-        return [], []
+        return [], [], [], []
 
     matrix = np.vstack(embeddings)
     if matrix.shape[0] == 1:
-        return [_normalize(matrix[0])], [1]
+        centroid = _normalize(matrix[0])
+        return [centroid], [1], [0.0], [1.0 / eps]
 
     n_clusters = min(max_clusters, matrix.shape[0])
 
     if n_clusters <= 1:
         centroid = _normalize(matrix.mean(axis=0))
-        return [centroid], [matrix.shape[0]]
+        distances = np.linalg.norm(matrix - centroid, axis=1)
+        radius = float(distances.mean())
+        weight = float(matrix.shape[0] / (radius + eps))
+        return [centroid], [matrix.shape[0]], [radius], [weight]
 
     # 変更理由: 正例・負例それぞれで複数クラスタを持たせ、
     #          後段の1-NN距離比較に使うためAgglomerativeClusteringで代表点を抽出。
@@ -368,13 +394,19 @@ def _cluster_embeddings(
 
     centroids: List[np.ndarray] = []
     counts: List[int] = []
+    radii: List[float] = []
+    weights: List[float] = []
     for cluster_id in np.unique(labels):
         cluster_embeddings = matrix[labels == cluster_id]
         centroid = _normalize(cluster_embeddings.mean(axis=0))
         centroids.append(centroid)
         counts.append(int(cluster_embeddings.shape[0]))
+        distances = np.linalg.norm(cluster_embeddings - centroid, axis=1)
+        radius = float(distances.mean())
+        radii.append(radius)
+        weights.append(float(counts[-1] / (radius + eps)))
 
-    return centroids, counts
+    return centroids, counts, radii, weights
 
 
 def create_rule_centroids(
@@ -412,10 +444,20 @@ def create_rule_centroids(
         if not compliant_embeddings or not violating_embeddings:
             continue
 
-        compliant_centroids, compliant_counts = _cluster_embeddings(
+        (
+            compliant_centroids,
+            compliant_counts,
+            compliant_radii,
+            compliant_weights,
+        ) = _cluster_embeddings(
             compliant_embeddings, max_clusters=max_clusters
         )
-        violating_centroids, violating_counts = _cluster_embeddings(
+        (
+            violating_centroids,
+            violating_counts,
+            violating_radii,
+            violating_weights,
+        ) = _cluster_embeddings(
             violating_embeddings, max_clusters=max_clusters
         )
 
@@ -424,6 +466,10 @@ def create_rule_centroids(
             "violating_centroids": violating_centroids,
             "compliant_counts": compliant_counts,
             "violating_counts": violating_counts,
+            "compliant_radii": compliant_radii,
+            "violating_radii": violating_radii,
+            "compliant_weights": compliant_weights,
+            "violating_weights": violating_weights,
         }
 
         print(
@@ -438,22 +484,35 @@ def create_rule_centroids(
     return rule_centroids
 
 
-def _nearest_distance(
-    embedding: np.ndarray, centroids: List[np.ndarray]
-) -> float:
+def _weighted_distances(
+    embedding: np.ndarray,
+    centroids: List[np.ndarray],
+    weights: List[float],
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Compute distance to each centroid with cluster-based reweighting."""
+
     if not centroids:
-        return float("inf")
-    distances = [np.linalg.norm(embedding - centroid) for centroid in centroids]
-    return float(min(distances))
+        return np.asarray([])
+
+    distances = np.array(
+        [np.linalg.norm(embedding - centroid) for centroid in centroids],
+        dtype=np.float64,
+    )
+    weight_arr = np.asarray(weights, dtype=np.float64)
+    adjusted = distances / np.maximum(weight_arr, eps)
+    return adjusted
 
 
 def predict_test_set_with_centroids(
     test_df: pd.DataFrame,
     text_to_embedding: Dict[str, np.ndarray],
     rule_centroids: Dict[str, RuleCentroidSummary],
+    tau: float = 0.08,
 ) -> np.ndarray:
-    """Predict test set using 1-NN distance over centroids."""
-    print("\nMaking predictions on test set with centroid 1-NN scoring...")
+    """Predict test set using softmin-aggregated, weighted centroid distances."""
+
+    print("\nMaking predictions on test set with centroid softmin scoring...")
 
     row_ids: List[int] = []
     predictions: List[float] = []
@@ -466,6 +525,10 @@ def predict_test_set_with_centroids(
 
         compliant_centroids = rule_centroids[rule]["compliant_centroids"]
         violating_centroids = rule_centroids[rule]["violating_centroids"]
+        compliant_weights = rule_centroids[rule]["compliant_weights"]
+        violating_weights = rule_centroids[rule]["violating_weights"]
+
+        per_rule_results: List[Tuple[int, float]] = []
 
         for _, row in rule_data.iterrows():
             body = cleaner(str(row["body"]))
@@ -476,15 +539,37 @@ def predict_test_set_with_centroids(
 
             body_embedding = text_to_embedding[body]
 
-            compliant_distance = _nearest_distance(body_embedding, compliant_centroids)
-            violating_distance = _nearest_distance(body_embedding, violating_centroids)
+            compliant_adjusted = _weighted_distances(
+                body_embedding, compliant_centroids, compliant_weights
+            )
+            violating_adjusted = _weighted_distances(
+                body_embedding, violating_centroids, violating_weights
+            )
 
-            # 変更理由: 各ルールで最も近い正クラスタと負クラスタの距離差を
-            #          直接スコア化することで、1-NN判定の鋭さを活かしAUC向上を狙う。
-            rule_prediction = violating_distance - compliant_distance
+            if compliant_adjusted.size == 0 or violating_adjusted.size == 0:
+                continue
 
+            compliant_score = float(softmin(compliant_adjusted, tau=tau))
+            violating_score = float(softmin(violating_adjusted, tau=tau))
+            rule_prediction = violating_score - compliant_score
+
+            per_rule_results.append((row_id, rule_prediction))
+
+        if not per_rule_results:
+            continue
+
+        rule_scores = np.array([score for _, score in per_rule_results], dtype=np.float64)
+        rule_mean = float(rule_scores.mean())
+        rule_std = float(rule_scores.std())
+
+        if rule_std > 1e-6:
+            normalized_scores = (rule_scores - rule_mean) / rule_std
+        else:
+            normalized_scores = rule_scores - rule_mean
+
+        for (row_id, _), normalized_score in zip(per_rule_results, normalized_scores):
             row_ids.append(row_id)
-            predictions.append(rule_prediction)
+            predictions.append(float(normalized_score))
 
     print(f"Made predictions for {len(predictions)} test examples")
     return row_ids, np.array(predictions)
@@ -493,7 +578,7 @@ def predict_test_set_with_centroids(
 def main():
     """Main inference pipeline."""
     print("=" * 70)
-    print("SIMILARITY CLASSIFIER - MULTI-CENTROID 1-NN")
+    print("SIMILARITY CLASSIFIER - SOFTMIN WEIGHTED CENTROIDS")
     print("=" * 70)
 
     test_df = load_test_data()
@@ -522,7 +607,7 @@ def main():
     print("PREDICTION PHASE")
     print("=" * 50)
     row_ids, predictions = predict_test_set_with_centroids(
-        test_df, text_to_embedding, rule_centroids
+        test_df, text_to_embedding, rule_centroids, tau=0.08
     )
 
     submission_df = pd.DataFrame({"row_id": row_ids, "rule_violation": predictions})
@@ -531,9 +616,11 @@ def main():
     print(f"\nSaved predictions for {len(submission_df)} test examples to submission.csv")
 
     print("\n" + "=" * 70)
-    print("MULTI-CENTROID 1-NN INFERENCE COMPLETED")
+    print("SOFTMIN-WEIGHTED CENTROID INFERENCE COMPLETED")
     print("Model: Fine-tuned BGE on test data triplets")
-    print("Method: Per-rule centroid clustering with 1-NN distance scoring")
+    print(
+        "Method: Per-rule centroid clustering with cluster-weighted softmin scoring"
+    )
     print(f"Predicted on {len(test_df)} test examples")
     if len(predictions) > 0:
         print(
