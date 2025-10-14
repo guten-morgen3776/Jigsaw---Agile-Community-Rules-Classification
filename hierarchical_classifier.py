@@ -1,7 +1,8 @@
 import os
-import re
 import random
+import re
 import warnings
+from typing import Dict, List
 from urllib.parse import urlparse
 
 import numpy as np
@@ -16,27 +17,13 @@ from sentence_transformers import (
 from sentence_transformers.losses import TripletLoss
 from sklearn.cluster import AgglomerativeClustering
 from tqdm.auto import tqdm
-from umap import UMAP
 
 
 warnings.filterwarnings("ignore")
 
 
-# ===============================
-# Similarity control parameters
-# ===============================
-# 変更理由: スコアリングに用いる重みをまとめて管理することで、後からの調整や
-#          探索を容易にしつつ一貫したロジックを保つため。
-SIM_WEIGHTS = {
-    "max": 0.6,
-    "mean": 0.3,
-    "contrast": 0.1,
-}
-TEMPERATURE = 0.75  # 変更理由: スコアをtanhで圧縮し極端な値を抑えることでAUCの安定化を狙う。
-
-
-def cleaner(text):
-    """Replace URLs with format: <url>: (domain/important-path)"""
+def cleaner(text: str) -> str:
+    """Replace URLs with a condensed placeholder."""
     if not text:
         return text
 
@@ -61,7 +48,7 @@ def cleaner(text):
     return re.sub(url_pattern, replace_url, str(text))
 
 
-def load_test_data():
+def load_test_data() -> pd.DataFrame:
     """Load test data."""
     print("Loading test data...")
     test_df = pd.read_csv("/kaggle/input/jigsaw-agile-community-rules/test.csv")
@@ -70,7 +57,7 @@ def load_test_data():
     return test_df
 
 
-def collect_all_texts(test_df):
+def collect_all_texts(test_df: pd.DataFrame) -> List[str]:
     """Collect all unique texts from test set."""
     print("\nCollecting all texts for embedding...")
 
@@ -97,8 +84,8 @@ def collect_all_texts(test_df):
     return all_texts
 
 
-def generate_embeddings(texts, model, batch_size=64):
-    """Generate BGE embeddings for all texts."""
+def generate_embeddings(texts: List[str], model: SentenceTransformer, batch_size: int = 64) -> np.ndarray:
+    """Generate embeddings for all texts."""
     print(f"Generating embeddings for {len(texts)} texts...")
 
     embeddings = model.encode(
@@ -113,18 +100,18 @@ def generate_embeddings(texts, model, batch_size=64):
 
 
 def create_test_triplet_dataset(
-    test_df,
-    augmentation_factor=2,
-    random_seed=42,
-    subsample_fraction=1.0,
-):
+    test_df: pd.DataFrame,
+    augmentation_factor: int = 2,
+    random_seed: int = 42,
+    subsample_fraction: float = 1.0,
+) -> Dataset:
     """Create triplet dataset from test data."""
     random.seed(random_seed)
     np.random.seed(random_seed)
 
-    anchors = []
-    positives = []
-    negatives = []
+    anchors: List[str] = []
+    positives: List[str] = []
+    negatives: List[str] = []
 
     print("Creating rule-aligned triplets from test data...")
 
@@ -133,8 +120,8 @@ def create_test_triplet_dataset(
     ):
         rule = cleaner(str(row["rule"]))
 
-        pos_examples = []
-        neg_examples = []
+        pos_examples: List[str] = []
+        neg_examples: List[str] = []
 
         for neg_col in ["negative_example_1", "negative_example_2"]:
             if pd.notna(row[neg_col]):
@@ -153,14 +140,14 @@ def create_test_triplet_dataset(
     if augmentation_factor > 0:
         print(f"Adding {augmentation_factor}x augmentation...")
 
-        rule_positives = {}
-        rule_negatives = {}
+        rule_positives: Dict[str, List[str]] = {}
+        rule_negatives: Dict[str, List[str]] = {}
 
         for rule in test_df["rule"].unique():
             rule_df = test_df[test_df["rule"] == rule]
 
-            pos_pool = []
-            neg_pool = []
+            pos_pool: List[str] = []
+            neg_pool: List[str] = []
 
             for _, row in rule_df.iterrows():
                 for neg_col in ["negative_example_1", "negative_example_2"]:
@@ -216,14 +203,14 @@ def create_test_triplet_dataset(
 
 
 def fine_tune_model(
-    model,
-    train_dataset,
-    epochs=3,
-    batch_size=32,
-    learning_rate=2e-5,
-    margin=0.25,
-    output_dir="./models/test-finetuned-bge",
-):
+    model: SentenceTransformer,
+    train_dataset: Dataset,
+    epochs: int = 3,
+    batch_size: int = 32,
+    learning_rate: float = 2e-5,
+    margin: float = 0.25,
+    output_dir: str = "./models/test-finetuned-bge",
+) -> SentenceTransformer:
     """Fine-tune the sentence transformer model using triplet loss."""
 
     print(f"Fine-tuning model on {len(train_dataset)} triplets...")
@@ -265,10 +252,10 @@ def fine_tune_model(
     print(f"Saving fine-tuned model to {final_model_path}...")
     model.save_pretrained(final_model_path)
 
-    return model, final_model_path
+    return model
 
 
-def load_or_create_finetuned_model(test_df):
+def load_or_create_finetuned_model(test_df: pd.DataFrame) -> SentenceTransformer:
     """Load fine-tuned model if exists, otherwise fine-tune a new one."""
 
     fine_tuned_path = "./models/test-finetuned-bge/final"
@@ -321,7 +308,7 @@ def load_or_create_finetuned_model(test_df):
         test_df, augmentation_factor=2, subsample_fraction=1.0
     )
 
-    fine_tuned_model, model_path = fine_tune_model(
+    fine_tuned_model = fine_tune_model(
         model=base_model,
         train_dataset=triplet_dataset,
         epochs=1,
@@ -330,12 +317,12 @@ def load_or_create_finetuned_model(test_df):
         margin=0.25,
     )
 
-    print(f"Fine-tuning completed. Model saved to: {model_path}")
+    print("Fine-tuning completed. Model saved to: ./models/test-finetuned-bge/final")
     fine_tuned_model.half()
     return fine_tuned_model
 
 
-def _normalize(vec):
+def _normalize(vec: np.ndarray) -> np.ndarray:
     """Safely normalize a vector to unit length."""
     norm = np.linalg.norm(vec)
     if norm == 0:
@@ -343,166 +330,119 @@ def _normalize(vec):
     return vec / norm
 
 
-def generate_rule_embeddings(test_df, model):
-    """Generate embeddings for each unique rule."""
-    print("Generating rule embeddings...")
+def _cluster_embeddings(
+    embeddings: List[np.ndarray],
+    max_clusters: int = 3,
+) -> List[np.ndarray]:
+    """Cluster embeddings and return centroids."""
+    if not embeddings:
+        return []
 
-    unique_rules = test_df["rule"].unique()
-    rule_embeddings = {}
+    matrix = np.vstack(embeddings)
+    if matrix.shape[0] == 1:
+        return [_normalize(matrix[0])]
 
-    for rule in unique_rules:
-        clean_rule = cleaner(str(rule))
-        rule_emb = model.encode(
-            clean_rule, convert_to_tensor=False, normalize_embeddings=True
-        )
-        rule_embeddings[rule] = np.asarray(rule_emb)
+    n_clusters = min(max_clusters, matrix.shape[0])
 
-    print(f"Generated embeddings for {len(rule_embeddings)} rules")
-    return rule_embeddings
+    if n_clusters <= 1:
+        return [_normalize(matrix.mean(axis=0))]
+
+    # 変更理由: 正例・負例それぞれで複数クラスタを持たせ、
+    #          後段の1-NN距離比較に使うためAgglomerativeClusteringで代表点を抽出。
+    clusterer = AgglomerativeClustering(n_clusters=n_clusters)
+    labels = clusterer.fit_predict(matrix)
+
+    centroids: List[np.ndarray] = []
+    for cluster_id in np.unique(labels):
+        cluster_embeddings = matrix[labels == cluster_id]
+        centroid = _normalize(cluster_embeddings.mean(axis=0))
+        centroids.append(centroid)
+
+    return centroids
 
 
-def _stack_centroids(centroid_list):
-    if not centroid_list:
-        return np.zeros((0,))
-    return np.stack(centroid_list)
+def create_rule_centroids(
+    test_df: pd.DataFrame,
+    text_to_embedding: Dict[str, np.ndarray],
+    max_clusters: int = 3,
+) -> Dict[str, Dict[str, List[np.ndarray]]]:
+    """Create multiple centroids per rule for compliant/violating examples."""
+    print("\nCreating rule centroids with multi-cluster 1-NN scoring...")
 
-
-def create_rule_centroids_with_hierarchical_clustering(
-    test_df, text_to_embedding, rule_embeddings
-):
-    """Create centroids using Hierarchical Clustering + UMAP."""
-    print("\nCreating rule centroids with Hierarchical Clustering + UMAP...")
-
-    umap_reducer = UMAP(n_components=32, random_state=42)
-
-    rule_centroids = {}
+    rule_centroids: Dict[str, Dict[str, List[np.ndarray]]] = {}
 
     for rule in test_df["rule"].unique():
         rule_data = test_df[test_df["rule"] == rule]
 
-        pos_embeddings = []
-        for _, row in rule_data.iterrows():
-            for col in ["positive_example_1", "positive_example_2"]:
-                if pd.notna(row[col]):
-                    clean_text = cleaner(str(row[col]))
-                    if clean_text in text_to_embedding:
-                        pos_embeddings.append(text_to_embedding[clean_text])
+        compliant_embeddings: List[np.ndarray] = []
+        violating_embeddings: List[np.ndarray] = []
 
-        neg_embeddings = []
         for _, row in rule_data.iterrows():
             for col in ["negative_example_1", "negative_example_2"]:
                 if pd.notna(row[col]):
                     clean_text = cleaner(str(row[col]))
                     if clean_text in text_to_embedding:
-                        neg_embeddings.append(text_to_embedding[clean_text])
+                        compliant_embeddings.append(text_to_embedding[clean_text])
+            for col in ["positive_example_1", "positive_example_2"]:
+                if pd.notna(row[col]):
+                    clean_text = cleaner(str(row[col]))
+                    if clean_text in text_to_embedding:
+                        violating_embeddings.append(text_to_embedding[clean_text])
 
-        if pos_embeddings and neg_embeddings:
-            pos_embeddings = np.array(pos_embeddings)
-            neg_embeddings = np.array(neg_embeddings)
+        if not compliant_embeddings or not violating_embeddings:
+            continue
 
-            if (
-                pos_embeddings.shape[0] > 10
-                and pos_embeddings.shape[0] > umap_reducer.n_components
-            ):
-                pos_reduced = umap_reducer.fit_transform(pos_embeddings)
-            else:
-                pos_reduced = pos_embeddings
+        compliant_centroids = _cluster_embeddings(
+            compliant_embeddings, max_clusters=max_clusters
+        )
+        violating_centroids = _cluster_embeddings(
+            violating_embeddings, max_clusters=max_clusters
+        )
 
-            if (
-                neg_embeddings.shape[0] > 10
-                and neg_embeddings.shape[0] > umap_reducer.n_components
-            ):
-                neg_reduced = umap_reducer.fit_transform(neg_embeddings)
-            else:
-                neg_reduced = neg_embeddings
+        rule_centroids[rule] = {
+            "compliant_centroids": compliant_centroids,
+            "violating_centroids": violating_centroids,
+        }
 
-            n_pos_clusters = min(3, len(pos_embeddings))
-            n_neg_clusters = min(3, len(neg_embeddings))
+        print(
+            # 変更理由: セントロイド数を明示してログ出力し、
+            #          学習データのばらつきとクラスタ分割の具合を確認しやすくする。
+            f"  Rule: {rule[:50]}... - compliant={len(compliant_centroids)}, "
+            f"violating={len(violating_centroids)}"
+        )
 
-            pos_centroids = []
-            neg_centroids = []
-
-            if n_pos_clusters > 1:
-                pos_clusterer = AgglomerativeClustering(n_clusters=n_pos_clusters)
-                pos_labels = pos_clusterer.fit_predict(pos_reduced)
-
-                for cluster_id in np.unique(pos_labels):
-                    cluster_mask = pos_labels == cluster_id
-                    cluster_embeddings = pos_embeddings[cluster_mask]
-                    cluster_centroid = _normalize(cluster_embeddings.mean(axis=0))
-                    pos_centroids.append(cluster_centroid)
-            else:
-                pos_centroid = _normalize(pos_embeddings.mean(axis=0))
-                pos_centroids.append(pos_centroid)
-
-            if n_neg_clusters > 1:
-                neg_clusterer = AgglomerativeClustering(n_clusters=n_neg_clusters)
-                neg_labels = neg_clusterer.fit_predict(neg_reduced)
-
-                for cluster_id in np.unique(neg_labels):
-                    cluster_mask = neg_labels == cluster_id
-                    cluster_embeddings = neg_embeddings[cluster_mask]
-                    cluster_centroid = _normalize(cluster_embeddings.mean(axis=0))
-                    neg_centroids.append(cluster_centroid)
-            else:
-                neg_centroid = _normalize(neg_embeddings.mean(axis=0))
-                neg_centroids.append(neg_centroid)
-
-            pos_proto = _normalize(np.mean(pos_centroids, axis=0))
-            neg_proto = _normalize(np.mean(neg_centroids, axis=0))
-            contrast_vector = _normalize(neg_proto - pos_proto)
-            # 変更理由: 違反・非違反の平均ベクトル差分を保持することで、スコア計算時に
-            #          より滑らかな方向性情報を利用しAUC向上を狙う。
-
-            rule_centroids[rule] = {
-                "positive_centroids": pos_centroids,
-                "negative_centroids": neg_centroids,
-                "pos_count": len(pos_embeddings),
-                "neg_count": len(neg_embeddings),
-                "rule_embedding": rule_embeddings[rule],
-                "contrast_vector": contrast_vector,
-            }
-
-            print(
-                f"  Rule: {rule[:50]}... - Pos: {len(pos_embeddings)}, "
-                f"Neg: {len(neg_embeddings)} - Clusters: Pos={len(pos_centroids)}, "
-                f"Neg={len(neg_centroids)}"
-            )
-
-    print(f"Created hierarchical centroids for {len(rule_centroids)} rules")
+    print(f"Created centroids for {len(rule_centroids)} rules")
     return rule_centroids
 
 
-def _compute_similarity_stats(embedding, centroids):
+def _nearest_distance(
+    embedding: np.ndarray, centroids: List[np.ndarray]
+) -> float:
     if not centroids:
-        return {"max": 0.0, "mean": 0.0}
-
-    centroid_matrix = _stack_centroids(centroids)
-    sims = centroid_matrix @ embedding
-
-    return {"max": float(np.max(sims)), "mean": float(np.mean(sims))}
+        return float("inf")
+    distances = [np.linalg.norm(embedding - centroid) for centroid in centroids]
+    return float(min(distances))
 
 
-def predict_test_set_with_hierarchical_clustering(
-    test_df, text_to_embedding, rule_centroids
-):
-    """Predict test set using hierarchical clustering centroids."""
-    print("\nMaking predictions on test set with Hierarchical Clustering centroids...")
+def predict_test_set_with_centroids(
+    test_df: pd.DataFrame,
+    text_to_embedding: Dict[str, np.ndarray],
+    rule_centroids: Dict[str, Dict[str, List[np.ndarray]]],
+) -> np.ndarray:
+    """Predict test set using 1-NN distance over centroids."""
+    print("\nMaking predictions on test set with centroid 1-NN scoring...")
 
-    row_ids = []
-    predictions = []
+    row_ids: List[int] = []
+    predictions: List[float] = []
 
     for rule in test_df["rule"].unique():
-        print(f"  Processing rule: {rule[:50]}...")
         rule_data = test_df[test_df["rule"] == rule]
 
         if rule not in rule_centroids:
             continue
 
-        centroids_info = rule_centroids[rule]
-        pos_centroids = centroids_info["positive_centroids"]
-        neg_centroids = centroids_info["negative_centroids"]
-        contrast_vector = centroids_info["contrast_vector"]
+        compliant_centroids = rule_centroids[rule]["compliant_centroids"]
+        violating_centroids = rule_centroids[rule]["violating_centroids"]
 
         for _, row in rule_data.iterrows():
             body = cleaner(str(row["body"]))
@@ -513,20 +453,12 @@ def predict_test_set_with_hierarchical_clustering(
 
             body_embedding = text_to_embedding[body]
 
-            pos_stats = _compute_similarity_stats(body_embedding, pos_centroids)
-            neg_stats = _compute_similarity_stats(body_embedding, neg_centroids)
+            compliant_distance = _nearest_distance(body_embedding, compliant_centroids)
+            violating_distance = _nearest_distance(body_embedding, violating_centroids)
 
-            contrast_score = float(body_embedding @ contrast_vector)
-            # 変更理由: クラスタ平均差分との内積を導入し、単一の最近傍距離に依存しない
-            #          滑らかな判定指標でAUC向上を狙う。
-
-            raw_score = (
-                SIM_WEIGHTS["max"] * (neg_stats["max"] - pos_stats["max"])
-                + SIM_WEIGHTS["mean"] * (neg_stats["mean"] - pos_stats["mean"])
-                + SIM_WEIGHTS["contrast"] * contrast_score
-            )
-
-            rule_prediction = np.tanh(raw_score / TEMPERATURE)
+            # 変更理由: 各ルールで最も近い正クラスタと負クラスタの距離差を
+            #          直接スコア化することで、1-NN判定の鋭さを活かしAUC向上を狙う。
+            rule_prediction = violating_distance - compliant_distance
 
             row_ids.append(row_id)
             predictions.append(rule_prediction)
@@ -536,9 +468,9 @@ def predict_test_set_with_hierarchical_clustering(
 
 
 def main():
-    """Main inference pipeline with Hierarchical Clustering + UMAP improvements."""
+    """Main inference pipeline."""
     print("=" * 70)
-    print("IMPROVED SIMILARITY CLASSIFIER - HIERARCHICAL CLUSTERING + UMAP")
+    print("SIMILARITY CLASSIFIER - MULTI-CENTROID 1-NN")
     print("=" * 70)
 
     test_df = load_test_data()
@@ -557,16 +489,16 @@ def main():
 
     text_to_embedding = {text: emb for text, emb in zip(all_texts, all_embeddings)}
 
-    rule_embeddings = generate_rule_embeddings(test_df, model)
-
-    rule_centroids = create_rule_centroids_with_hierarchical_clustering(
-        test_df, text_to_embedding, rule_embeddings
+    rule_centroids = create_rule_centroids(
+        test_df,
+        text_to_embedding,
+        max_clusters=3,
     )
 
     print("\n" + "=" * 50)
     print("PREDICTION PHASE")
     print("=" * 50)
-    row_ids, predictions = predict_test_set_with_hierarchical_clustering(
+    row_ids, predictions = predict_test_set_with_centroids(
         test_df, text_to_embedding, rule_centroids
     )
 
@@ -576,9 +508,9 @@ def main():
     print(f"\nSaved predictions for {len(submission_df)} test examples to submission.csv")
 
     print("\n" + "=" * 70)
-    print("HIERARCHICAL CLUSTERING + UMAP INFERENCE COMPLETED")
+    print("MULTI-CENTROID 1-NN INFERENCE COMPLETED")
     print("Model: Fine-tuned BGE on test data triplets")
-    print("Method: Hierarchical clustering + UMAP dimensionality reduction")
+    print("Method: Per-rule centroid clustering with 1-NN distance scoring")
     print(f"Predicted on {len(test_df)} test examples")
     if len(predictions) > 0:
         print(
