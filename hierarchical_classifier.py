@@ -2,7 +2,7 @@ import os
 import random
 import re
 import warnings
-from typing import Dict, List
+from typing import Dict, List, Tuple, TypedDict
 from urllib.parse import urlparse
 
 import numpy as np
@@ -322,6 +322,13 @@ def load_or_create_finetuned_model(test_df: pd.DataFrame) -> SentenceTransformer
     return fine_tuned_model
 
 
+class RuleCentroidSummary(TypedDict):
+    compliant_centroids: List[np.ndarray]
+    violating_centroids: List[np.ndarray]
+    compliant_counts: List[int]
+    violating_counts: List[int]
+
+
 def _normalize(vec: np.ndarray) -> np.ndarray:
     """Safely normalize a vector to unit length."""
     norm = np.linalg.norm(vec)
@@ -333,43 +340,56 @@ def _normalize(vec: np.ndarray) -> np.ndarray:
 def _cluster_embeddings(
     embeddings: List[np.ndarray],
     max_clusters: int = 3,
-) -> List[np.ndarray]:
-    """Cluster embeddings and return centroids."""
+) -> Tuple[List[np.ndarray], List[int]]:
+    """Cluster embeddings and return (centroid, cluster_size) tuples.
+
+    AgglomerativeClustering (Ward linkage / Euclidean) を使い、
+    サンプル数に応じて最大 ``max_clusters`` 個までボトムアップにクラスタを生成し、
+    各クラスタの平均ベクトルを正規化して代表点とします。
+    """
     if not embeddings:
-        return []
+        return [], []
 
     matrix = np.vstack(embeddings)
     if matrix.shape[0] == 1:
-        return [_normalize(matrix[0])]
+        return [_normalize(matrix[0])], [1]
 
     n_clusters = min(max_clusters, matrix.shape[0])
 
     if n_clusters <= 1:
-        return [_normalize(matrix.mean(axis=0))]
+        centroid = _normalize(matrix.mean(axis=0))
+        return [centroid], [matrix.shape[0]]
 
     # 変更理由: 正例・負例それぞれで複数クラスタを持たせ、
     #          後段の1-NN距離比較に使うためAgglomerativeClusteringで代表点を抽出。
+    #          Ward法 (デフォルト) で分割し、クラスタ内サンプル数も控えて解析できるようにする。
     clusterer = AgglomerativeClustering(n_clusters=n_clusters)
     labels = clusterer.fit_predict(matrix)
 
     centroids: List[np.ndarray] = []
+    counts: List[int] = []
     for cluster_id in np.unique(labels):
         cluster_embeddings = matrix[labels == cluster_id]
         centroid = _normalize(cluster_embeddings.mean(axis=0))
         centroids.append(centroid)
+        counts.append(int(cluster_embeddings.shape[0]))
 
-    return centroids
+    return centroids, counts
 
 
 def create_rule_centroids(
     test_df: pd.DataFrame,
     text_to_embedding: Dict[str, np.ndarray],
     max_clusters: int = 3,
-) -> Dict[str, Dict[str, List[np.ndarray]]]:
-    """Create multiple centroids per rule for compliant/violating examples."""
+) -> Dict[str, RuleCentroidSummary]:
+    """Create multiple centroids per rule for compliant/violating examples.
+
+    各ルール × (準拠 / 違反) の埋め込み集合に対し ``_cluster_embeddings`` を適用し、
+    AgglomerativeClustering で生成した複数クラスタの中心とクラスタサイズを保存します。
+    """
     print("\nCreating rule centroids with multi-cluster 1-NN scoring...")
 
-    rule_centroids: Dict[str, Dict[str, List[np.ndarray]]] = {}
+    rule_centroids: Dict[str, RuleCentroidSummary] = {}
 
     for rule in test_df["rule"].unique():
         rule_data = test_df[test_df["rule"] == rule]
@@ -392,23 +412,26 @@ def create_rule_centroids(
         if not compliant_embeddings or not violating_embeddings:
             continue
 
-        compliant_centroids = _cluster_embeddings(
+        compliant_centroids, compliant_counts = _cluster_embeddings(
             compliant_embeddings, max_clusters=max_clusters
         )
-        violating_centroids = _cluster_embeddings(
+        violating_centroids, violating_counts = _cluster_embeddings(
             violating_embeddings, max_clusters=max_clusters
         )
 
         rule_centroids[rule] = {
             "compliant_centroids": compliant_centroids,
             "violating_centroids": violating_centroids,
+            "compliant_counts": compliant_counts,
+            "violating_counts": violating_counts,
         }
 
         print(
             # 変更理由: セントロイド数を明示してログ出力し、
             #          学習データのばらつきとクラスタ分割の具合を確認しやすくする。
-            f"  Rule: {rule[:50]}... - compliant={len(compliant_centroids)}, "
-            f"violating={len(violating_centroids)}"
+            f"  Rule: {rule[:50]}... - compliant={len(compliant_centroids)}"
+            f" (sizes={compliant_counts}), violating={len(violating_centroids)}"
+            f" (sizes={violating_counts})"
         )
 
     print(f"Created centroids for {len(rule_centroids)} rules")
@@ -427,7 +450,7 @@ def _nearest_distance(
 def predict_test_set_with_centroids(
     test_df: pd.DataFrame,
     text_to_embedding: Dict[str, np.ndarray],
-    rule_centroids: Dict[str, Dict[str, List[np.ndarray]]],
+    rule_centroids: Dict[str, RuleCentroidSummary],
 ) -> np.ndarray:
     """Predict test set using 1-NN distance over centroids."""
     print("\nMaking predictions on test set with centroid 1-NN scoring...")
