@@ -132,7 +132,7 @@ class FocalLossTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.focal_config = focal_config or FocalLossConfig()
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         sample_weight = inputs.pop("sample_weight", None)
         labels = inputs.pop("labels") if "labels" in inputs else None
         outputs = model(**inputs)
