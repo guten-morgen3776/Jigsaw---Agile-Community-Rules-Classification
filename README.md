@@ -1,1 +1,0 @@
-# Jigsaw---Agile-Community-Rules-Classification
